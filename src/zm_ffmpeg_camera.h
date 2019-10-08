@@ -87,9 +87,9 @@ class FfmpegCamera : public Camera {
 #endif
 
     int64_t             startTime;
-
+    bool                decode_;
   public:
-    FfmpegCamera( int p_id, const std::string &path, const std::string &p_method, const std::string &p_options, int p_width, int p_height, int p_colours, int p_brightness, int p_contrast, int p_hue, int p_colour, bool p_capture, bool p_record_audio );
+    FfmpegCamera( int p_id, const std::string &path, const std::string &p_method, const std::string &p_options, int p_width, int p_height, int p_colours, int p_brightness, int p_contrast, int p_hue, int p_colour, bool p_capture, bool p_record_audio, bool p_decode );
     ~FfmpegCamera();
 
     const std::string &Path() const { return( mPath ); }

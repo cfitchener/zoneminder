@@ -82,11 +82,12 @@ static AVPixelFormat get_format(AVCodecContext *avctx, const enum AVPixelFormat 
 }
 #endif
 
-FfmpegCamera::FfmpegCamera( int p_id, const std::string &p_path, const std::string &p_method, const std::string &p_options, int p_width, int p_height, int p_colours, int p_brightness, int p_contrast, int p_hue, int p_colour, bool p_capture, bool p_record_audio ) :
+FfmpegCamera::FfmpegCamera( int p_id, const std::string &p_path, const std::string &p_method, const std::string &p_options, int p_width, int p_height, int p_colours, int p_brightness, int p_contrast, int p_hue, int p_colour, bool p_capture, bool p_record_audio, bool p_decode ) :
   Camera( p_id, FFMPEG_SRC, p_width, p_height, p_colours, ZM_SUBPIX_ORDER_DEFAULT_FOR_COLOUR(p_colours), p_brightness, p_contrast, p_hue, p_colour, p_capture, p_record_audio ),
   mPath( p_path ),
   mMethod( p_method ),
-  mOptions( p_options )
+  mOptions( p_options ),
+  decode_(p_decode)
 {
   if ( capture ) {
     Initialise();
@@ -707,7 +708,7 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
           // Check for Connection failure.
           (ret == -110)
          ) {
-        Info("Unable to read packet from stream %d: error %d \"%s\".", packet.stream_index, ret, errbuf);
+        Info("Unable to read packet from stream %d: error %d \"%s\". Decoding: %d.", packet.stream_index, ret, errbuf, decode_);
       } else {
         Error("Unable to read packet from stream %d: error %d \"%s\".", packet.stream_index, ret, errbuf);
       }
@@ -721,8 +722,8 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
     //Video recording
     if ( recording.tv_sec ) {
 
-      uint32_t last_event_id = monitor->GetLastEventId() ;
-      uint32_t video_writer_event_id = monitor->GetVideoWriterEventId();
+      uint32_t last_event_id = monitor->GetLastEventId();
+      uint32_t video_writer_event_id = decode_ ? monitor->GetVideoWriterEventId() : monitor->GetVideoWriter2EventId();
 
       if ( last_event_id != video_writer_event_id ) {
         Debug(2, "Have change of event.  last_event(%d), our current (%d)",
@@ -745,17 +746,28 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
           videoStore = NULL;
           have_video_keyframe = false;
 
-          monitor->SetVideoWriterEventId(0);
+          if (decode_) {
+	    monitor->SetVideoWriterEventId(0);
+	  } else {
+	    monitor->SetVideoWriter2EventId(0);
+	  }
         } // end if videoStore
       } // end if end of recording
 
       if ( last_event_id and !videoStore ) {
         //Instantiate the video storage module
-
+        char event_file_scratch[4096];
+	char suffix[] = "_highres.mp4";
+	sprintf(event_file_scratch, "%s", event_file);
+	if (!decode_) {
+	  memcpy(&event_file_scratch[strlen(event_file_scratch) - 4],
+		 suffix, 13);
+	}
+			     
         if ( record_audio ) {
           if ( mAudioStreamId == -1 ) {
             Debug(3, "Record Audio on but no audio stream found");
-            videoStore = new VideoStore((const char *) event_file, "mp4",
+            videoStore = new VideoStore((const char *) event_file_scratch, "mp4",
                 mFormatContext->streams[mVideoStreamId],
                 NULL,
                 startTime,
@@ -763,7 +775,7 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
 
           } else {
             Debug(3, "Video module initiated with audio stream");
-            videoStore = new VideoStore((const char *) event_file, "mp4",
+            videoStore = new VideoStore((const char *) event_file_scratch, "mp4",
                 mFormatContext->streams[mVideoStreamId],
                 mFormatContext->streams[mAudioStreamId],
                 startTime,
@@ -773,7 +785,7 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
           if ( mAudioStreamId >= 0 ) {
             Debug(3, "Record_audio is false so exclude audio stream");
           }
-          videoStore = new VideoStore((const char *) event_file, "mp4",
+          videoStore = new VideoStore((const char *) event_file_scratch, "mp4",
               mFormatContext->streams[mVideoStreamId],
               NULL,
               startTime,
@@ -785,7 +797,12 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
           videoStore = NULL;
 
         } else {
-          monitor->SetVideoWriterEventId( last_event_id );
+	  if (decode_) {
+	    monitor->SetVideoWriterEventId( last_event_id );
+	  } else {
+	    monitor->SetVideoWriter2EventId( last_event_id );
+	  }
+
 
           // Need to write out all the frames from the last keyframe?
           // No... need to write out all frames from when the event began. Due to PreEventFrames, this could be more than since the last keyframe.
@@ -826,7 +843,12 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
         delete videoStore;
         videoStore = NULL;
         have_video_keyframe = false;
-        monitor->SetVideoWriterEventId(0);
+        if (decode_) {
+	  monitor->SetVideoWriterEventId(0);
+	}
+	else {
+	  monitor->SetVideoWriter2EventId(0);
+	}
       }
 
       // Buffer video packets, since we are not recording.
@@ -849,7 +871,6 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
         }
       }
     } // end if recording or not
-
     if ( packet.stream_index == mVideoStreamId ) {
       // only do decode if we have had a keyframe, should save a few cycles.
       if ( have_video_keyframe || keyframe ) {
@@ -865,7 +886,10 @@ int FfmpegCamera::CaptureAndRecord( Image &image, timeval recording, char* event
           have_video_keyframe = true;
         }
       } // end if keyframe or have_video_keyframe
-
+      if (!decode_) {
+	zm_av_packet_unref(&packet);
+	return 0;
+      }
       Debug(4, "about to decode video");
 
 #if LIBAVCODEC_VERSION_CHECK(57, 64, 0, 64, 0)

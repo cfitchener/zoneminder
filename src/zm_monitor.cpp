@@ -22,6 +22,9 @@
 #include <arpa/inet.h>
 #include <glob.h>
 #include <cinttypes>
+#include <iostream>
+#include <fstream>
+#include <string>
 
 #include "zm.h"
 #include "zm_db.h"
@@ -63,6 +66,29 @@
 #ifndef MAP_LOCKED
 #define MAP_LOCKED 0
 #endif
+
+
+void Monitor::SecondStream::operator()() {
+  Info("Second thread starting");
+  if (!camera_) return;
+  Info("Second thread priming camera");
+    badstate_ = camera_->PrimeCapture() < 0;
+    while(!badstate_) {
+      badstate_ = (camera_->PreCapture() < 0) || badstate_;
+      badstate_ = (camera_->CaptureAndRecord(unused_image_, video_store_data_->recording,
+					     video_store_data_->event_file) < 0) || badstate_;
+      badstate_ = (camera_->PostCapture() < 0) || badstate_;
+    }
+    camera_->Close();
+}
+void Monitor::SecondStream::Close() {
+       badstate_ = true;
+     }
+Monitor::SecondStream::~SecondStream() {
+Info("SecondStream destructor, %x", this);
+  delete camera_;
+}
+
 
 // This is the official SQL (and ordering of the fields) to load a Monitor.
 // It will be used whereever a Monitor dbrow is needed. WHERE conditions can be appended
@@ -278,6 +304,7 @@ Monitor::Monitor(
   bool p_enabled,
   const char *p_linked_monitors,
   Camera *p_camera,
+  Camera *p_camera2,
   int p_orientation,
   unsigned int p_deinterlacing,
   int p_savejpegs,
@@ -351,6 +378,7 @@ Monitor::Monitor(
   purpose( p_purpose ),
   last_motion_score(0),
   camera( p_camera ),
+  camera2( p_camera2 ),
   n_zones( p_n_zones ),
   zones( p_zones ),
   timestamps( 0 ),
@@ -403,6 +431,7 @@ Monitor::Monitor(
   else
     event_close_mode = CLOSE_IDLE;
 
+  Debug(1, "Capture delay: %d", capture_delay);
   Debug( 1, "monitor purpose=%d", purpose );
 
   mem_size = sizeof(SharedData)
@@ -514,9 +543,10 @@ Debug(2,"last_write_index(%d), last_write_time(%d)", shared_data->last_write_ind
 
 
 bool Monitor::connect() {
-  Debug(3, "Connecting to monitor.  Purpose is %d", purpose );
+  Info("Connecting to monitor.  Purpose is %d", purpose );
 #if ZM_MEM_MAPPED
   snprintf( mem_file, sizeof(mem_file), "%s/zm.mmap.%d", staticConfig.PATH_MAP.c_str(), id );
+  Debug(1,"Testing memfile: %s", mem_file);
   map_fd = open( mem_file, O_RDWR|O_CREAT, (mode_t)0600 );
   if ( map_fd < 0 ) {
     Fatal( "Can't open memory map file %s, probably not enough space free: %s", mem_file, strerror(errno) );
@@ -621,7 +651,7 @@ bool Monitor::connect() {
     images = new Image *[pre_event_count];
     last_signal = shared_data->signal;
   }
-Debug(3, "Success connecting");
+Info("Success connecting");
   return true;
 }
 
@@ -2108,6 +2138,7 @@ Monitor *Monitor::Load(MYSQL_ROW dbrow, bool load_zones, Purpose purpose) {
   bool embed_exif = (*dbrow[col] != '0'); col++;
 
   Camera *camera = 0;
+  Camera *camera2 = 0;
   if ( type == "Local" ) {
 
 #if ZM_HAS_V4L
@@ -2208,8 +2239,40 @@ Monitor *Monitor::Load(MYSQL_ROW dbrow, bool load_zones, Purpose purpose) {
       hue,
       colour,
       purpose==CAPTURE,
-      record_audio
-    );
+      record_audio,
+      true
+      );
+    char second_config_path[100];
+    sprintf(second_config_path, "/etc/zm/second_streams/%d/config", id);
+    std::ifstream second_config (second_config_path);
+    if (second_config.is_open()) {
+      string second_path;
+      getline(second_config, second_path);
+      std::string second_width;
+      getline(second_config, second_width);
+      std::string second_height;
+      getline(second_config, second_height);
+      second_config.close();
+      Info("Got second stream config: Path: %s, Width %d, Height %d", second_path.c_str(), atoi(second_width.c_str()), atoi(second_height.c_str()));
+
+      camera2 = new FfmpegCamera(
+        id,
+        second_path.c_str(),
+        method,
+        options,
+        atoi(second_width.c_str()),
+        atoi(second_height.c_str()),
+        colours,
+        brightness,
+        contrast,
+        hue,
+        colour,
+        purpose==CAPTURE,
+        record_audio,
+	false
+      ); 
+    }
+    
 #endif // HAVE_LIBAVFORMAT
   } else if ( type == "NVSocket" ) {
       camera = new RemoteCameraNVSocket(
@@ -2280,6 +2343,7 @@ Monitor *Monitor::Load(MYSQL_ROW dbrow, bool load_zones, Purpose purpose) {
       enabled,
       linked_monitors,
       camera,
+      camera2,
       orientation,
       deinterlacing,
       savejpegs,
@@ -2315,6 +2379,7 @@ Monitor *Monitor::Load(MYSQL_ROW dbrow, bool load_zones, Purpose purpose) {
       0
     );
   camera->setMonitor(monitor);
+  if (camera2) camera2->setMonitor(monitor);
   Zone **zones = 0;
   int n_zones = Zone::Load(monitor, zones);
   monitor->AddZones(n_zones, zones);
@@ -2380,7 +2445,7 @@ int Monitor::Capture() {
           *capture_image,
           video_store_data->recording,
           video_store_data->event_file
-          );
+          );			
     } else {
       /* Capture directly into image buffer, avoiding the need to memcpy() */
       captureResult = camera->Capture(*capture_image);
@@ -2797,10 +2862,28 @@ bool Monitor::DumpSettings( char *output, bool verbose ) {
 
 unsigned int Monitor::Colours() const { return camera->Colours(); }
 unsigned int Monitor::SubpixelOrder() const { return camera->SubpixelOrder(); }
-int Monitor::PrimeCapture() const { return camera->PrimeCapture(); }
-int Monitor::PreCapture() const { return camera->PreCapture(); }
-int Monitor::PostCapture() const { return camera->PostCapture() ; }
-int Monitor::Close() { return camera->Close(); };
+int Monitor::PrimeCapture() {
+  second_stream_.camera_ = camera2;
+  second_stream_.video_store_data_ = video_store_data;
+  Info("Trying to start the second stream thread, member address: %x", &second_stream_);
+  std::thread * mythread = new std::thread([&] { second_stream_(); });
+  second_stream_thread_.reset(mythread);
+  usleep(1000000);
+  return camera->PrimeCapture();
+}
+int Monitor::PreCapture() const {
+  if (second_stream_.badstate_) return -1;
+  return camera->PreCapture();
+}
+int Monitor::PostCapture() const {
+  if (second_stream_.badstate_) return -1;
+  return camera->PostCapture() ;
+}
+int Monitor::Close() {
+  second_stream_.Close();
+  second_stream_thread_->join();
+  return camera->Close();
+};
 Monitor::Orientation Monitor::getOrientation() const { return orientation; }
 
 Monitor::Snapshot *Monitor::getSnapshot() const {

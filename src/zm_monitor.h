@@ -1,3 +1,4 @@
+
 //
 // ZoneMinder Monitor Class Interfaces, $Date$, $Revision$
 // Copyright (C) 2001-2008 Philip Coombes
@@ -177,6 +178,7 @@ protected:
   typedef struct {
     uint32_t size;
     uint64_t current_event;
+    uint64_t current_event_2;
     char event_file[4096];
     timeval recording;      // used as both bool and a pointer to the timestamp when recording should begin
     //uint32_t frameNumber;
@@ -332,6 +334,7 @@ protected:
   Snapshot    *pre_event_buffer;
 
   Camera      *camera;
+  Camera      *camera2;
   Event       *event;
   Storage     *storage;
 
@@ -349,6 +352,19 @@ protected:
 
   std::vector<Group *> groups;
 
+  class SecondStream {
+  public:
+    void operator()();
+     void Close();
+     ~SecondStream();
+    Camera *camera_ = NULL;
+    VideoStoreData *video_store_data_ = NULL;
+    bool badstate_ = false;
+    Image unused_image_;
+  };
+  SecondStream second_stream_;
+  std::unique_ptr<std::thread> second_stream_thread_;
+  
 public:
   explicit Monitor( int p_id );
 
@@ -363,6 +379,7 @@ public:
     bool p_enabled,
     const char *p_linked_monitors,
     Camera *p_camera,
+    Camera *p_camera2,
     int p_orientation,
     unsigned int p_deinterlacing,
     int p_savejpegs,
@@ -455,6 +472,8 @@ public:
   const std::vector<EncoderParameter_t>* GetOptEncoderParams() const { return &encoderparamsvec; }
   uint64_t GetVideoWriterEventId() const { return video_store_data->current_event; }
   void SetVideoWriterEventId( unsigned long long p_event_id ) { video_store_data->current_event = p_event_id; }
+  uint64_t GetVideoWriter2EventId() const { return video_store_data->current_event_2; }
+  void SetVideoWriter2EventId( unsigned long long p_event_id ) { video_store_data->current_event_2 = p_event_id; }
  
   unsigned int GetPreEventCount() const { return pre_event_count; };
   State GetState() const;
@@ -488,7 +507,7 @@ public:
   int actionColour( int p_colour=-1 );
   int actionContrast( int p_contrast=-1 );
 
-  int PrimeCapture() const;
+  int PrimeCapture();
   int PreCapture() const;
   int Capture();
   int PostCapture() const;
